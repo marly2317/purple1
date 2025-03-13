@@ -44,55 +44,59 @@ db = "shopping_assistant.sqlite"
 
 @tool
 def recommend_capsule_wardrobe(situation: str, gender: str, max_price: float) -> Dict:
-    """Рекомендует капсульный гардероб с учетом ситуации, пола и бюджета"""
+    """Рекомендует капсульный гардероб с учетом пола и уникальных типов одежды"""
     try:
         conn = sqlite3.connect(db)
         cursor = conn.cursor()
-        
-        # Определяем целевую категорию
-        category_map = {
-            "male": "Men's Clothing",
-            "female": "Women's Clothing"
-        }
-        target_category = category_map.get(gender.lower(), "Clothing")
+
+        # Типы одежды для делового стиля (уникальные)
+        clothing_types = ["shirt", "suit", "trousers", "shoes", "blazer"]
+        gender_filter = "male" if gender.lower() == "male" else "female"
 
         query = """
-        SELECT 
-            id, title, description, price, brand, category, thumbnail
-        FROM products 
+        SELECT DISTINCT 
+            id, title, description, price, brand, category 
+        FROM products
         WHERE 
-            category LIKE ? AND 
+            category = 'Business Clothing' AND
             price <= ? AND
-            (description LIKE '%formal%' OR description LIKE '%business%')
+            gender = ? AND
+            (
+                LOWER(title) LIKE ? OR 
+                LOWER(description) LIKE ?
+            )
         ORDER BY rating DESC
-        LIMIT 5
+        LIMIT 1
         """
-        
-        # Параметры в правильном порядке: 1) категория, 2) цена
-        cursor.execute(query, (f"%{target_category}%", max_price))
-        
-        items = cursor.fetchall()
-        if not items:
-            return {"error": "Нет подходящих вариантов в данном ценовом диапазоне"}
 
-        return {
-            "recommendations": [
-                {
+        recommendations = []
+        used_types = set()
+        
+        # Подбираем по одному товару каждого типа
+        for c_type in clothing_types:
+            cursor.execute(
+                query, 
+                [max_price, gender_filter, f"%{c_type}%", f"%{c_type}%"]
+            )
+            item = cursor.fetchone()
+            if item and c_type not in used_types:
+                recommendations.append({
                     "title": item[1],
                     "price": item[3],
                     "brand": item[4],
-                    "category": item[5],
-                    "image": item[6]
-                } for item in items
-            ],
-            "total_price": sum(item[3] for item in items)
-        }
+                    "type": c_type  # Добавляем тип для контроля
+                })
+                used_types.add(c_type)
 
-    except Exception as e:
-        return {"error": str(e)}
-    finally:
         conn.close()
 
+        if not recommendations:
+            return {"error": "Нет подходящих вариантов для указанного пола и бюджета."}
+
+        return {"recommendations": recommendations}
+
+    except Exception as e:
+        return {"error": f"Ошибка: {str(e)}"}
 @tool
 def recommend_style(situation: str) -> Dict:
     """Рекомендует капсульный гардероб на основе анализа описания и атрибутов"""

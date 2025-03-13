@@ -6,8 +6,8 @@ import os
 import time
 from httpx import HTTPStatusError
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import ToolMessage
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import ToolMessage, HumanMessage, AIMessage
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from tools import (
     recommend_capsule_wardrobe,
     recommend_style,
@@ -22,10 +22,22 @@ from tools import (
     view_checkout_info,
     get_delivery_estimate,
     get_payment_options,
-    
 )
 from graph import ShoppingGraph
 from db_init import init_database
+
+def validate_message_order(messages):
+    """Валидация порядка сообщений в цепочке"""
+    last_role = None
+    for msg in messages:
+        if isinstance(msg, HumanMessage):
+            if last_role == "tool":
+                raise ValueError("Human message after tool message")
+            last_role = "user"
+        elif isinstance(msg, AIMessage):
+            last_role = "assistant"
+        elif isinstance(msg, ToolMessage):
+            last_role = "tool"
 
 def main():
     # Инициализация базы данных
@@ -34,45 +46,25 @@ def main():
     # Инициализация модели Mistral
     llm = init_chat_model("mistral-large-latest", model_provider="mistralai")
 
-    # Шаблон для ассистента
+    # Шаблон для ассистента с MessagesPlaceholder
     primary_assistant_prompt = ChatPromptTemplate.from_messages([
-    (
-        "system",
-        """Вы профессиональный AI-стилист с расширенными возможностями. Ваши основные задачи:
+        (
+            "system",
+            """Вы строгий AI-стилист, работающий ТОЛЬКО по правилам:
 
-1. Анализ запросов:
-- При словах "гардероб", "комплект", "набор", "сочетание", "подбери" → использовать recommend_capsule_wardrobe
-- При запросах на стиль/внешний вид ("как сочетать", "что надеть") → использовать recommend_style
-- Для поиска конкретных товаров → использовать fetch_product_*
+1. На запросы со словами 'гардероб', 'капсул', 'комплект' → ТОЛЬКО инструмент recommend_capsule_wardrobe
+2. Обязательные параметры:
+   - gender: male/female (определять из контекста)
+   - max_price: число (обязательно запрашивать если не указано)
+   - situation: ВСЕГДА 'business meeting'
+3. Запрещено использовать другие инструменты для этих запросов
 
-2. Определение параметров:
-- Пол (gender): 
-  • male - если упоминания: мужской, для него, мужчине
-  • female - женский, для нее, женщине
-  • по умолчанию - unisex
-- Бюджет (max_price): 
-  • Извлекать числовые значения после: "до $X", "бюджет X", "не дороже X"
-- Ситуация (situation): 
-  • Автоматическая классификация: деловая, повседневная, вечерняя, спортивная
-
-3. Правила ответов:
-- Всегда запрашивать недостающие параметры уточняющими вопросами
-- Для делового стиля приоритет: костюмы, рубашки, классические брюки
-- Показывать не более 5 вариантов в рекомендации
-- Учитывать текущий сезон при подборе ({current_season})
-
-Примеры корректных вызовов:
-1. {{"tool": "recommend_capsule_wardrobe", "args": {{"gender": "male", "max_price": 500, "situation": "деловая встреча"}}}}
-2. {{"tool": "recommend_style", "args": {{"situation": "повседневный образ"}}}}
-
-Текущая дата: {current_date}
-Локализация: Россия/Москва"""
-    ),
-    ("placeholder", "{messages}"),
-]).partial(
-    current_date=datetime.now().strftime("%d.%m.%Y"),
-    current_season="осень/зима"  # Автоматическое определение сезона
-)
+Пример корректного вызова:
+{{"tool": "recommend_capsule_wardrobe", "args": {{"situation": "business meeting", "gender": "male", "max_price": 10000}}}}
+"""
+        ),
+        MessagesPlaceholder(variable_name="messages"),  # Используем MessagesPlaceholder для обработки сообщений
+    ])
 
     # Привязка инструментов
     tools_no_confirmation = [
@@ -89,7 +81,6 @@ def main():
         get_payment_options,
     ]
     tools_need_confirmation = [add_to_cart, remove_from_cart]
-    confirmation_tool_names = {t.name for t in tools_need_confirmation}
 
     assistant_runnable = primary_assistant_prompt | llm.bind_tools(
         tools_no_confirmation + tools_need_confirmation
@@ -107,37 +98,48 @@ def main():
         }
     }
 
-    print("Please wait for initialization")
+    print("Please wait for initialization...")
     
     # Инициализация с обработкой rate limit
-    initial_query = "Please welcome me, and show me some available products and category."
+    initial_query = "Please welcome me and show available products and categories."
     max_attempts = 5
     attempt = 0
+    initial_events = None
+
     while attempt < max_attempts:
         try:
-            initial_events = shopping_graph.stream_responses({"messages": ("user", initial_query)}, config)
+            # Передаем сообщения как список HumanMessage
+            initial_events = shopping_graph.stream_responses({"messages": [HumanMessage(content=initial_query)]}, config)
             break
         except HTTPStatusError as err:
-            if err.response.status_code == 429:  # Rate limit
-                retry_after = int(err.response.headers.get("Retry-After", 10))
-                print(f"Rate limit exceeded during initialization. Waiting {retry_after} seconds before retrying...")
+            if err.response.status_code == 429:
+                retry_after = int(err.response.headers.get("Retry-After", 30))
+                print(f"Rate limit exceeded. Waiting {retry_after} seconds...")
                 time.sleep(retry_after)
+                attempt += 1
             else:
-                print(f"An HTTP error occurred: {err}")
+                print(f"HTTP Error: {err}")
                 break
-            attempt += 1
+        except Exception as e:
+            print(f"Unexpected error: {str(e)}")
+            break
 
     if initial_events is None:
-        print("Failed to fetch initial products after multiple attempts.")
+        print("Failed to initialize after multiple attempts.")
         return
 
+    # Вывод начальных данных
     for event in initial_events:
-        final_result = event
-    final_result["messages"][-1].pretty_print()
+        try:
+            validate_message_order(event["messages"])
+            _print_event(event, set())
+        except ValueError as ve:
+            print(f"Validation error: {str(ve)}")
+            break
 
     print("\nType your question below (or type 'exit' to end):\n")
 
-    # Основной цикл с улучшенной обработкой rate limit
+    # Основной цикл
     while True:
         question = input("\nYou: ")
         if question.lower() == 'exit':
@@ -145,51 +147,35 @@ def main():
             break
 
         attempt = 0
-        while attempt < max_attempts:
+        success = False
+        while attempt < max_attempts and not success:
             try:
-                events = shopping_graph.stream_responses({"messages": ("user", question)}, config)
+                # Передаем сообщения как список HumanMessage
+                events = shopping_graph.stream_responses({"messages": [HumanMessage(content=question)]}, config)
                 _printed = set()
                 for event in events:
-                    _print_event(event, _printed)
-                break
+                    try:
+                        validate_message_order(event["messages"])
+                        _print_event(event, _printed)
+                    except ValueError as ve:
+                        print(f"Validation error: {str(ve)}")
+                        break
+                success = True
             except HTTPStatusError as err:
-                if err.response.status_code == 429:  # Rate limit
-                    retry_after = int(err.response.headers.get("Retry-After", 10))
-                    print(f"Rate limit exceeded. Waiting {retry_after} seconds before retrying...")
+                if err.response.status_code == 429:
+                    retry_after = int(err.response.headers.get("Retry-After", 30))
+                    print(f"Rate limit exceeded. Waiting {retry_after} seconds...")
                     time.sleep(retry_after)
                     attempt += 1
                 else:
-                    print(f"An HTTP error occurred: {err}")
+                    print(f"HTTP Error: {err}")
                     break
-        if attempt == max_attempts:
-            print("Failed to process your request after multiple attempts.")
+            except Exception as e:
+                print(f"Unexpected error: {str(e)}")
+                break
 
-        # Обработка подтверждений
-        snapshot = shopping_graph.get_state(config)
-        while snapshot.next:
-            try:
-                user_input = input(
-                    "\nAre you sure about that? Type 'y' to continue;"
-                    " otherwise, explain your requested changed.\n"
-                )
-            except:
-                user_input = "y"
-            if user_input.strip() == "y":
-                result = shopping_graph.invoke(None, config)
-                print(result['messages'][-1].content)
-            else:
-                result = shopping_graph.invoke(
-                    {
-                        "messages": [
-                            ToolMessage(
-                                tool_call_id=event["messages"][-1].tool_calls[0]["id"],
-                                content=f"API call denied by user. Reasoning: '{user_input}'. Continue assisting, accounting for the user's input.",
-                            )
-                        ]
-                    },
-                    config,
-                )
-            snapshot = shopping_graph.get_state(config)
+        if not success:
+            print("Failed to process your request after multiple attempts.")
 
 if __name__ == "__main__":
     main()
